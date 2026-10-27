@@ -1,16 +1,20 @@
+use std::collections::HashSet;
 use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::diff::parse_patch;
-use crate::model::{Checks, Comment, FileDiff, FileStatus, Pr, PrDetail, Review, Side, Thread};
+use crate::model::{Check, CheckState, Checks, Comment, FileDiff, FileStatus, Pr, PrDetail, Review, ReviewState, Reviewer, Side, Thread};
 
-const GRAPHQL: &str = "https://api.github.com/graphql";
+/// Overridable so the end-to-end tests can point ght at a fake GitHub on localhost.
+fn api_base() -> String {
+    std::env::var("GHT_API_URL").unwrap_or_else(|_| "https://api.github.com".into())
+}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Account {
     pub login: String,
     pub active: bool,
@@ -23,6 +27,22 @@ pub fn accounts() -> Result<Vec<Account>> {
 
 pub fn token(login: &str) -> Result<String> {
     Ok(gh(&["auth", "token", "--user", login])?.trim().to_string())
+}
+
+/// GitHub repos (lowercase `owner/name`) that the current directory's git remotes point at.
+/// Empty outside a git checkout.
+pub fn local_repos() -> HashSet<String> {
+    let Ok(out) = Command::new("git").args(["remote", "-v"]).output() else { return HashSet::new() };
+    String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| repo_from_remote(l.split_whitespace().nth(1)?)).collect()
+}
+
+pub fn repo_from_remote(url: &str) -> Option<String> {
+    let (_, path) = url.split_once("github.com")?;
+    let path = path.trim_start_matches([':', '/']).trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let mut parts = path.split('/');
+    let (owner, name) = (parts.next()?, parts.next()?);
+    (!owner.is_empty() && !name.is_empty()).then(|| format!("{owner}/{name}").to_lowercase())
 }
 
 fn gh(args: &[&str]) -> Result<String> {
@@ -45,7 +65,7 @@ fn parse_accounts(json: &str) -> Result<Vec<Account>> {
 }
 
 fn graphql(token: &str, query: &str, variables: Value) -> Result<Value> {
-    let resp: Value = ureq::post(GRAPHQL)
+    let resp: Value = ureq::post(&format!("{}/graphql", api_base()))
         .set("Authorization", &format!("bearer {token}"))
         .set("User-Agent", "ght")
         .send_json(json!({ "query": query, "variables": variables }))
@@ -200,7 +220,113 @@ query($owner: String!, $name: String!, $number: Int!, $after: String) {
   }
 }"#;
 
+const STATUS_QUERY: &str = r#"
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      latestReviews(first: 100) { nodes { author { login } state submittedAt url } }
+      reviewRequests(first: 100) { nodes { requestedReviewer { __typename ... on User { login } ... on Team { name } } } }
+      commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) { totalCount nodes {
+        __typename
+        ... on CheckRun { name status conclusion detailsUrl startedAt completedAt isRequired(pullRequestNumber: $number) checkSuite { workflowRun { workflow { name } } } }
+        ... on StatusContext { context state targetUrl createdAt isRequired(pullRequestNumber: $number) }
+      } } } } } }
+    }
+  }
+}"#;
+
+/// Threads, files and reviews/checks are three separate requests, so fetch them side by side.
 pub fn fetch_detail(token: &str, repo: &str, number: u64) -> Result<PrDetail> {
+    let (threads, files, status) = std::thread::scope(|s| {
+        let threads = s.spawn(|| fetch_threads(token, repo, number));
+        let status = s.spawn(|| fetch_status(token, repo, number));
+        let files = fetch_files(token, repo, number);
+        (joined(threads.join()), files, joined(status.join()))
+    });
+    let (reviewers, checks, checks_total) = status?;
+    Ok(PrDetail { threads: threads?, files: files?, reviewers, checks, checks_total })
+}
+
+fn joined<T>(r: std::thread::Result<Result<T>>) -> Result<T> {
+    r.unwrap_or_else(|_| Err(anyhow!("fetch panicked")))
+}
+
+fn fetch_status(token: &str, repo: &str, number: u64) -> Result<(Vec<Reviewer>, Vec<Check>, usize)> {
+    let (owner, name) = repo.split_once('/').context("repo must be owner/name")?;
+    parse_status(&graphql(token, STATUS_QUERY, json!({ "owner": owner, "name": name, "number": number }))?)
+}
+
+fn parse_status(data: &Value) -> Result<(Vec<Reviewer>, Vec<Check>, usize)> {
+    let pr = &data["repository"]["pullRequest"];
+    if pr.is_null() {
+        bail!("pull request not found");
+    }
+    let mut reviewers: Vec<Reviewer> = Vec::new();
+    for r in pr["latestReviews"]["nodes"].as_array().into_iter().flatten() {
+        let state = match r["state"].as_str() {
+            Some("APPROVED") => ReviewState::Approved,
+            Some("CHANGES_REQUESTED") => ReviewState::ChangesRequested,
+            Some("COMMENTED") => ReviewState::Commented,
+            Some("DISMISSED") => ReviewState::Dismissed,
+            _ => continue,
+        };
+        reviewers.push(Reviewer {
+            login: r["author"]["login"].as_str().unwrap_or("ghost").to_string(),
+            state: Some(state),
+            requested: false,
+            at: r["submittedAt"].as_str().and_then(|t| t.parse().ok()),
+            url: r["url"].as_str().map(str::to_string),
+        });
+    }
+    for r in pr["reviewRequests"]["nodes"].as_array().into_iter().flatten() {
+        let who = &r["requestedReviewer"];
+        let Some(login) = who["login"].as_str().or(who["name"].as_str()) else { continue };
+        match reviewers.iter_mut().find(|x| x.login == login) {
+            Some(x) => x.requested = true,
+            None => reviewers.push(Reviewer { login: login.to_string(), state: None, requested: true, at: None, url: None }),
+        }
+    }
+
+    let contexts = &pr["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"];
+    let str_of = |v: &Value| v.as_str().map(str::to_string);
+    let time_of = |v: &Value| v.as_str().and_then(|t| t.parse().ok());
+    let checks = contexts["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|c| !c.is_null())
+        .map(|c| {
+            let run = c["__typename"] == "CheckRun";
+            let state = if run {
+                match (c["status"].as_str(), c["conclusion"].as_str()) {
+                    (Some(s), _) if s != "COMPLETED" => CheckState::Pending,
+                    (_, Some("SUCCESS")) => CheckState::Passing,
+                    (_, Some("NEUTRAL" | "SKIPPED" | "STALE")) => CheckState::Skipped,
+                    _ => CheckState::Failing,
+                }
+            } else {
+                match c["state"].as_str() {
+                    Some("SUCCESS") => CheckState::Passing,
+                    Some("PENDING" | "EXPECTED") => CheckState::Pending,
+                    _ => CheckState::Failing,
+                }
+            };
+            Check {
+                name: str_of(if run { &c["name"] } else { &c["context"] }).unwrap_or_default(),
+                workflow: str_of(&c["checkSuite"]["workflowRun"]["workflow"]["name"]).map(|w| w.trim().to_string()),
+                state,
+                required: c["isRequired"].as_bool().unwrap_or(false),
+                url: str_of(if run { &c["detailsUrl"] } else { &c["targetUrl"] }),
+                started: time_of(if run { &c["startedAt"] } else { &c["createdAt"] }),
+                completed: time_of(&c["completedAt"]),
+            }
+        })
+        .collect::<Vec<_>>();
+    let total = contexts["totalCount"].as_u64().map_or(checks.len(), |n| n as usize);
+    Ok((reviewers, checks, total))
+}
+
+fn fetch_threads(token: &str, repo: &str, number: u64) -> Result<Vec<Thread>> {
     let (owner, name) = repo.split_once('/').context("repo must be owner/name")?;
     let mut threads = Vec::new();
     let mut after = Value::Null;
@@ -210,13 +336,15 @@ pub fn fetch_detail(token: &str, repo: &str, number: u64) -> Result<PrDetail> {
         threads.extend(page);
         match next {
             Some(cursor) => after = Value::String(cursor),
-            None => break,
+            None => return Ok(threads),
         }
     }
+}
 
+fn fetch_files(token: &str, repo: &str, number: u64) -> Result<Vec<FileDiff>> {
     let mut files = Vec::new();
     for page in 1..=30 {
-        let url = format!("https://api.github.com/repos/{repo}/pulls/{number}/files?per_page=100&page={page}");
+        let url = format!("{}/repos/{repo}/pulls/{number}/files?per_page=100&page={page}", api_base());
         let body: Value = ureq::get(&url)
             .set("Authorization", &format!("bearer {token}"))
             .set("User-Agent", "ght")
@@ -231,7 +359,7 @@ pub fn fetch_detail(token: &str, repo: &str, number: u64) -> Result<PrDetail> {
             break;
         }
     }
-    Ok(PrDetail { threads, files })
+    Ok(files)
 }
 
 fn parse_threads(data: &Value) -> Result<(Vec<Thread>, Option<String>)> {
@@ -336,6 +464,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn remote_urls_to_repo() {
+        for url in [
+            "https://github.com/Devolutions/IronRDP.git",
+            "https://github.com/Devolutions/IronRDP",
+            "git@github.com:Devolutions/IronRDP.git",
+            "ssh://git@github.com/Devolutions/IronRDP/",
+        ] {
+            assert_eq!(repo_from_remote(url).as_deref(), Some("devolutions/ironrdp"), "{url}");
+        }
+        assert_eq!(repo_from_remote("https://gitlab.com/a/b"), None);
+        assert_eq!(repo_from_remote("https://github.com/only"), None);
+    }
+
+    #[test]
     fn accounts_from_gh_status() {
         let json = r#"{"hosts":{"github.com":[{"state":"success","active":true,"login":"work"},{"state":"success","active":false,"login":"home"}]}}"#;
         assert_eq!(
@@ -394,5 +536,49 @@ mod tests {
         assert!(!files[0].has_patch);
         assert_eq!(files[1].status, FileStatus::Renamed);
         assert_eq!(files[1].lines.len(), 3);
+    }
+
+    #[test]
+    fn status_maps_reviewers_and_checks() {
+        let data = json!({ "repository": { "pullRequest": {
+            "latestReviews": { "nodes": [
+                { "author": { "login": "ann" }, "state": "APPROVED", "submittedAt": "2026-10-01T00:00:00Z", "url": "r1" },
+                { "author": { "login": "bob" }, "state": "CHANGES_REQUESTED", "submittedAt": "2026-10-01T00:00:00Z", "url": "r2" },
+                { "author": { "login": "me" }, "state": "PENDING", "submittedAt": null, "url": "r3" }
+            ] },
+            "reviewRequests": { "nodes": [
+                { "requestedReviewer": { "__typename": "User", "login": "bob" } },
+                { "requestedReviewer": { "__typename": "Team", "name": "core" } }
+            ] },
+            "commits": { "nodes": [ { "commit": { "statusCheckRollup": { "contexts": { "totalCount": 120, "nodes": [
+                { "__typename": "CheckRun", "name": "test", "status": "COMPLETED", "conclusion": "FAILURE", "detailsUrl": "d1",
+                  "startedAt": "2026-10-01T00:00:00Z", "completedAt": "2026-10-01T00:07:00Z", "isRequired": true,
+                  "checkSuite": { "workflowRun": { "workflow": { "name": " CI " } } } },
+                { "__typename": "CheckRun", "name": "lint", "status": "IN_PROGRESS", "conclusion": null, "detailsUrl": "d2",
+                  "startedAt": null, "completedAt": null, "isRequired": false, "checkSuite": { "workflowRun": null } },
+                { "__typename": "CheckRun", "name": "docs", "status": "COMPLETED", "conclusion": "SKIPPED", "detailsUrl": "d3", "isRequired": false },
+                { "__typename": "StatusContext", "context": "ci/legacy", "state": "SUCCESS", "targetUrl": "t1", "createdAt": "2026-10-01T00:00:00Z", "isRequired": false },
+                null
+            ] } } } } ] }
+        }}});
+        let (reviewers, checks, total) = parse_status(&data).unwrap();
+        let summary: Vec<_> = reviewers.iter().map(|r| (r.login.as_str(), r.state, r.requested)).collect();
+        assert_eq!(
+            summary,
+            vec![("ann", Some(ReviewState::Approved), false), ("bob", Some(ReviewState::ChangesRequested), true), ("core", None, true)],
+            "a pending (own draft) review is left out; a re-request marks the existing reviewer"
+        );
+        let summary: Vec<_> = checks.iter().map(|c| (c.name.as_str(), c.workflow.as_deref(), c.state, c.required)).collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("test", Some("CI"), CheckState::Failing, true),
+                ("lint", None, CheckState::Pending, false),
+                ("docs", None, CheckState::Skipped, false),
+                ("ci/legacy", None, CheckState::Passing, false),
+            ]
+        );
+        assert_eq!(checks[3].url.as_deref(), Some("t1"));
+        assert_eq!(total, 120);
     }
 }

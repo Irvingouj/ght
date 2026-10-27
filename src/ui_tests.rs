@@ -57,6 +57,27 @@ fn threads_tab_lists_threads_and_shows_conversation() {
 }
 
 #[test]
+fn status_tab_shows_reviewers_and_checks() {
+    let mut app = detail_app();
+    assert!(screen(&mut app, 120, 24).contains("Status ✗1 ●1 ✓1"));
+    app.handle_key(key(KeyCode::BackTab));
+    let s = screen(&mut app, 120, 24);
+    for needle in ["Reviews and checks", "✗ bob", "changes requested", "✓ ann", "approved", "● cid", "review requested", "Checks  ✗1 ●1 ✓1", "✗ CI / test", "required", "7m", "running 10m", "✓ CI / lint", "enter/o open in browser"] {
+        assert!(s.contains(needle), "missing {needle:?} in\n{s}");
+    }
+
+    let mut app = detail_app();
+    let d = app.detail.as_mut().unwrap();
+    d.tab = crate::app::Tab::Status;
+    let mut empty = (*d.ready().unwrap()).clone();
+    (empty.reviewers, empty.checks, empty.checks_total) = (Vec::new(), Vec::new(), 0);
+    app.on_msg(Msg::Detail { repo: "o/alpha".into(), number: 12, result: Ok(empty) });
+    let s = screen(&mut app, 120, 24);
+    assert!(s.contains("Nobody has reviewed or been asked to review yet."), "{s}");
+    assert!(s.contains("No CI checks on the last commit."), "{s}");
+}
+
+#[test]
 fn files_tab_shows_tree_and_diff_with_inline_threads() {
     let mut app = detail_app();
     typ(&mut app, "j");
@@ -122,4 +143,35 @@ fn stack_tree_and_hidden_draft_count_render() {
     assert!(s.contains("1 drafts hidden (d shows)"), "{s}");
     assert!(s.contains("└─ Refactor tree"), "{s}");
     assert!(!s.contains("Bump deps"), "{s}");
+}
+
+#[test]
+fn current_repo_header_is_marked() {
+    let mut app = loaded_app();
+    app.here = ["o/beta".to_string()].into();
+    let s = screen(&mut app, 110, 14);
+    assert!(s.contains("▾ o/beta  1  (this repo)"), "{s}");
+}
+
+#[test]
+fn top_bar_shows_cached_age_while_refreshing() {
+    let mut app = App::new();
+    app.on_msg(Msg::Accounts(Ok(vec![crate::github::Account { login: "work".into(), active: true }])));
+    app.restore(crate::cache::Snapshot { saved_at: chrono::Utc::now() - chrono::Duration::hours(3), prs: prs(), details: vec![] });
+    let s = screen(&mut app, 110, 8);
+    assert!(s.contains("updated 3h  refreshing…"), "{s}");
+}
+
+#[test]
+fn search_total_matches_the_list_when_a_draft_is_kept() {
+    let mut app = loaded_app();
+    let mut fresh = prs();
+    fresh[2].is_draft = true;
+    fresh[2].head = "b3".into();
+    fresh[3].repo = "o/alpha".into();
+    fresh[3].base = "b3".into();
+    app.on_msg(Msg::Prs { account: "work".into(), result: Ok(fresh) });
+    typ(&mut app, "/");
+    let s = screen(&mut app, 110, 12);
+    assert!(s.contains("4/4"), "{s}");
 }

@@ -4,7 +4,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::app::{App, Effect, Msg};
 use crate::diff::parse_patch;
 use crate::github::Account;
-use crate::model::{Comment, FileDiff, FileStatus, Pr, PrDetail, Side, Thread};
+use crate::model::{Check, CheckState, Comment, FileDiff, FileStatus, Pr, PrDetail, ReviewState, Reviewer, Side, Thread};
 
 pub fn pr(repo: &str, number: u64, title: &str, hours_ago: i64, unresolved: usize, total: usize) -> Pr {
     Pr {
@@ -25,10 +25,11 @@ pub fn pr(repo: &str, number: u64, title: &str, hours_ago: i64, unresolved: usiz
     }
 }
 
+/// Repos by latest update: alpha (2h), beta (3h), Gamma (24h).
 /// Rows: 0 ▾o/alpha, 1 #12, 2 #3, 3 ▾o/beta, 4 #5, 5 ▾O/Gamma, 6 #7.
 pub fn prs() -> Vec<Pr> {
     vec![
-        pr("o/beta", 5, "Fix login bug", 1, 0, 0),
+        pr("o/beta", 5, "Fix login bug", 3, 0, 0),
         pr("o/alpha", 12, "Add agent picker", 2, 3, 4),
         pr("o/alpha", 3, "Refactor tree", 5, 0, 1),
         pr("O/Gamma", 7, "Bump deps", 24, 0, 0),
@@ -85,6 +86,34 @@ pub fn detail() -> PrDetail {
             thread("README.md", None, Side::Right, false, true, "typo"),
             thread("src/main.rs", Some(11), Side::Left, false, false, "keep b = 2"),
         ],
+        reviewers: vec![
+            reviewer("ann", Some(ReviewState::Approved), false),
+            reviewer("bob", Some(ReviewState::ChangesRequested), false),
+            reviewer("cid", None, true),
+        ],
+        checks: vec![
+            check("lint", CheckState::Passing),
+            check("test", CheckState::Failing),
+            check("deploy", CheckState::Pending),
+        ],
+        checks_total: 3,
+    }
+}
+
+fn reviewer(login: &str, state: Option<ReviewState>, requested: bool) -> Reviewer {
+    let url = state.map(|_| format!("https://github.com/o/alpha/pull/12#review-{login}"));
+    Reviewer { login: login.into(), state, requested, at: state.map(|_| Utc::now() - Duration::hours(2)), url }
+}
+
+fn check(name: &str, state: CheckState) -> Check {
+    Check {
+        name: name.into(),
+        workflow: Some("CI".into()),
+        state,
+        required: name == "test",
+        url: Some(format!("https://github.com/o/alpha/actions/{name}")),
+        started: Some(Utc::now() - Duration::minutes(10)),
+        completed: (state != CheckState::Pending).then(|| Utc::now() - Duration::minutes(3)),
     }
 }
 

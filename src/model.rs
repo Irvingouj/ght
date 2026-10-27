@@ -1,20 +1,21 @@
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Checks {
     Passing,
     Failing,
     Pending,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Review {
     Approved,
     ChangesRequested,
     Required,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Pr {
     pub repo: String,
     pub number: u64,
@@ -38,13 +39,13 @@ impl Pr {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Side {
     Left,
     Right,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Comment {
     pub author: String,
     pub body: String,
@@ -52,7 +53,7 @@ pub struct Comment {
     pub url: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Thread {
     pub path: String,
     pub line: Option<u32>,
@@ -76,7 +77,7 @@ impl Thread {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FileStatus {
     Added,
     Modified,
@@ -97,7 +98,7 @@ impl FileStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LineKind {
     Hunk,
     Add,
@@ -106,7 +107,7 @@ pub enum LineKind {
     Meta,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiffLine {
     pub kind: LineKind,
     pub old: Option<u32>,
@@ -114,7 +115,7 @@ pub struct DiffLine {
     pub text: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileDiff {
     pub path: String,
     pub previous_path: Option<String>,
@@ -126,10 +127,56 @@ pub struct FileDiff {
     pub lines: Vec<DiffLine>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReviewState {
+    ChangesRequested,
+    Approved,
+    Commented,
+    Dismissed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Reviewer {
+    pub login: String,
+    /// `None` when they were asked to review and have not yet.
+    pub state: Option<ReviewState>,
+    pub requested: bool,
+    pub at: Option<DateTime<Utc>>,
+    pub url: Option<String>,
+}
+
+/// Variant order is display order: failures first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum CheckState {
+    Failing,
+    Pending,
+    Passing,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Check {
+    pub name: String,
+    pub workflow: Option<String>,
+    pub state: CheckState,
+    pub required: bool,
+    pub url: Option<String>,
+    pub started: Option<DateTime<Utc>>,
+    pub completed: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PrDetail {
     pub threads: Vec<Thread>,
     pub files: Vec<FileDiff>,
+    // Defaults let caches written before these fields existed still load.
+    #[serde(default)]
+    pub reviewers: Vec<Reviewer>,
+    #[serde(default)]
+    pub checks: Vec<Check>,
+    /// GitHub can report more checks than one page holds; this is the full count.
+    #[serde(default)]
+    pub checks_total: usize,
 }
 
 pub fn age(now: DateTime<Utc>, then: DateTime<Utc>) -> String {

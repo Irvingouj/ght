@@ -7,7 +7,7 @@ fn row_labels(app: &App) -> Vec<String> {
     app.dash_rows()
         .iter()
         .map(|r| match r {
-            DashRow::Group { repo, count, collapsed } => format!("{}{repo} {count}", if *collapsed { "+" } else { "-" }),
+            DashRow::Group { repo, count, collapsed, .. } => format!("{}{repo} {count}", if *collapsed { "+" } else { "-" }),
             DashRow::Pr { idx, .. } => format!("#{}", app.prs[*idx].number),
         })
         .collect()
@@ -481,25 +481,25 @@ fn stack_labels(rows: &[DashRow], prs: &[Pr]) -> Vec<String> {
 #[test]
 fn stacked_prs_nest_under_their_base_pr() {
     let prs = stacked_prs();
-    let rows = dash_rows(&prs, "", &HashSet::new(), true);
-    assert_eq!(rows[0], DashRow::Group { repo: "o/stack".into(), count: 7, collapsed: false });
+    let rows = dash_rows(&prs, "", &HashSet::new(), true, &HashSet::new());
+    assert_eq!(rows[0], DashRow::Group { repo: "o/stack".into(), count: 7, collapsed: false, here: false });
     assert_eq!(stack_labels(&rows, &prs), vec!["#7", "#5", "└─ #6", "#1", "├─ #4", "└─ #2", "   └─ #3"]);
 }
 
 #[test]
 fn drafts_hidden_unless_something_is_stacked_on_them() {
     let prs = stacked_prs();
-    let rows = dash_rows(&prs, "", &HashSet::new(), false);
+    let rows = dash_rows(&prs, "", &HashSet::new(), false, &HashSet::new());
     assert_eq!(stack_labels(&rows, &prs), vec!["#5", "└─ #6", "#1", "├─ #4", "└─ #2", "   └─ #3"], "#7 hidden, #5 kept for #6");
     assert!(matches!(rows[0], DashRow::Group { count: 6, .. }));
 }
 
 #[test]
-fn search_lists_matches_flat_and_skips_hidden_drafts() {
+fn search_finds_exactly_the_prs_the_list_shows() {
     let prs = stacked_prs();
-    let rows = dash_rows(&prs, "pr", &HashSet::new(), false);
+    let rows = dash_rows(&prs, "pr", &HashSet::new(), false, &HashSet::new());
     let labels = stack_labels(&rows, &prs);
-    assert_eq!(labels.len(), 5, "drafts #5 and #7 hidden: {labels:?}");
+    assert_eq!(labels.len(), 6, "#7 hidden; #5 stays because #6 builds on it: {labels:?}");
     assert!(labels.iter().all(|l| l.starts_with('#')));
 }
 
@@ -507,7 +507,7 @@ fn search_lists_matches_flat_and_skips_hidden_drafts() {
 fn base_branch_cycle_still_lists_every_pr() {
     let mut prs = stacked_prs();
     prs[0].base = "b3".into();
-    let rows = dash_rows(&prs, "", &HashSet::new(), true);
+    let rows = dash_rows(&prs, "", &HashSet::new(), true, &HashSet::new());
     assert_eq!(stack_labels(&rows, &prs).len(), 7);
 }
 
@@ -527,4 +527,125 @@ fn d_toggles_drafts_and_keeps_cursor() {
     assert_eq!(app.selected_pr().map(|p| p.number), before);
     typ(&mut app, "Gd");
     assert_eq!(app.selected_pr().map(|p| p.number), Some(12), "cursor falls back when its PR hides");
+}
+
+#[test]
+fn repos_rank_by_latest_update_and_current_repo_goes_first() {
+    let mut app = loaded_app();
+    let groups = |app: &App| -> Vec<(String, bool)> {
+        app.dash_rows()
+            .iter()
+            .filter_map(|r| match r {
+                DashRow::Group { repo, here, .. } => Some((repo.clone(), *here)),
+                DashRow::Pr { .. } => None,
+            })
+            .collect()
+    };
+    assert_eq!(groups(&app), vec![("o/alpha".into(), false), ("o/beta".into(), false), ("O/Gamma".into(), false)]);
+
+    app.here = ["o/gamma".to_string()].into();
+    app.on_msg(Msg::Prs { account: "work".into(), result: Ok(crate::testutil::prs()) });
+    assert_eq!(groups(&app)[0], ("O/Gamma".into(), true));
+    assert_eq!(app.selected_pr().map(|p| p.number), Some(7), "cursor starts in the current repo");
+}
+
+#[test]
+fn e_asks_to_edit_the_pr_branch_from_list_and_detail() {
+    let mut app = loaded_app();
+    assert_eq!(typ(&mut app, "e"), vec![Effect::Edit { repo: "o/alpha".into(), branch: "b12".into() }]);
+    typ(&mut app, "gg");
+    assert_eq!(typ(&mut app, "e"), vec![], "nothing on a repo header");
+    let mut app = detail_app();
+    assert_eq!(typ(&mut app, "e"), vec![Effect::Edit { repo: "o/alpha".into(), branch: "b12".into() }]);
+    app.handle_key(key(KeyCode::Tab));
+    typ(&mut app, "/e");
+    assert_eq!(detail(&app).file_query, "e", "e is plain text while finding a file");
+}
+
+#[test]
+fn y_copies_the_pr_url_from_list_and_detail() {
+    let mut app = loaded_app();
+    assert_eq!(typ(&mut app, "y"), vec![Effect::Copy("https://github.com/o/alpha/pull/12".into())]);
+    typ(&mut app, "gg");
+    assert_eq!(typ(&mut app, "y"), vec![], "nothing on a repo header");
+    let mut app = detail_app();
+    assert_eq!(typ(&mut app, "y"), vec![Effect::Copy("https://github.com/o/alpha/pull/12".into())]);
+    app.handle_key(key(KeyCode::Tab));
+    assert_eq!(typ(&mut app, "y"), vec![Effect::Copy("https://github.com/o/alpha/pull/12".into())], "same url on the Files tab");
+}
+
+#[test]
+fn status_tab_lists_blockers_first_and_opens_them() {
+    let mut app = detail_app();
+    app.handle_key(key(KeyCode::Tab));
+    app.handle_key(key(KeyCode::Tab));
+    assert_eq!(detail(&app).tab, Tab::Status);
+    let data = detail(&app).ready().unwrap();
+    let order: Vec<String> = crate::app::status_items(&data)
+        .into_iter()
+        .map(|i| match i {
+            crate::app::StatusItem::Reviewer(r) => data.reviewers[r].login.clone(),
+            crate::app::StatusItem::Check(c) => data.checks[c].name.clone(),
+        })
+        .collect();
+    assert_eq!(order, ["bob", "ann", "cid", "test", "deploy", "lint"]);
+
+    assert_eq!(typ(&mut app, "o"), vec![Effect::Open("https://github.com/o/alpha/pull/12#review-bob".into())]);
+    typ(&mut app, "2j");
+    assert_eq!(typ(&mut app, "o"), vec![Effect::Open("https://github.com/o/alpha/pull/12".into())], "a pending request has no review page");
+    typ(&mut app, "j");
+    assert_eq!(app.handle_key(key(KeyCode::Enter)), Some(Effect::Open("https://github.com/o/alpha/actions/test".into())));
+    typ(&mut app, "G");
+    assert_eq!(detail(&app).st_cursor, 5);
+
+    app.handle_key(key(KeyCode::Tab));
+    assert_eq!(detail(&app).tab, Tab::Threads, "tab wraps around");
+    app.handle_key(key(KeyCode::BackTab));
+    assert_eq!(detail(&app).tab, Tab::Status);
+    typ(&mut app, "h");
+    assert!(app.detail.is_none(), "h goes back to the list");
+}
+
+#[test]
+fn account_refresh_with_same_account_does_not_reload() {
+    let mut app = loaded_app();
+    let accounts = vec![crate::github::Account { login: "work".into(), active: true }, crate::github::Account { login: "new".into(), active: false }];
+    assert_eq!(app.on_msg(Msg::Accounts(Ok(accounts))), None);
+    assert_eq!(app.accounts, vec!["work".to_string(), "new".to_string()]);
+}
+
+#[test]
+fn list_load_prefetches_only_stale_details() {
+    let mut app = App::new();
+    app.on_msg(Msg::Accounts(Ok(vec![crate::github::Account { login: "work".into(), active: true }])));
+    let effect = app.on_msg(Msg::Prs { account: "work".into(), result: Ok(prs()) });
+    let Some(Effect::Prefetch(keys)) = effect else { panic!("{effect:?}") };
+    assert_eq!(keys.len(), 4);
+
+    app.on_msg(Msg::Detail { repo: "o/alpha".into(), number: 12, result: Ok(crate::testutil::detail()) });
+    let same = app.prs.clone();
+    let Some(Effect::Prefetch(keys)) = app.on_msg(Msg::Prs { account: "work".into(), result: Ok(same.clone()) }) else { panic!() };
+    assert!(!keys.contains(&("o/alpha".to_string(), 12)), "fresh detail is not fetched again");
+
+    let mut bumped = same;
+    let i = bumped.iter().position(|p| p.number == 12).unwrap();
+    bumped[i].updated_at += chrono::Duration::minutes(1);
+    let Some(Effect::Prefetch(keys)) = app.on_msg(Msg::Prs { account: "work".into(), result: Ok(bumped) }) else { panic!() };
+    assert!(keys.contains(&("o/alpha".to_string(), 12)), "a newer updatedAt makes it stale");
+}
+
+#[test]
+fn snapshot_restores_list_and_details_with_cursor() {
+    let app = detail_app();
+    let snap = app.snapshot();
+    assert_eq!(snap.details.len(), 1);
+
+    let mut fresh = App::new();
+    fresh.on_msg(Msg::Accounts(Ok(vec![crate::github::Account { login: "work".into(), active: true }])));
+    fresh.restore(snap);
+    assert_eq!(fresh.prs.len(), 4);
+    assert_eq!(fresh.status, Status::Loading, "still refreshing in the background");
+    assert_eq!(fresh.selected_pr().map(|p| p.number), Some(12));
+    assert_eq!(fresh.handle_key(key(KeyCode::Enter)), Some(Effect::LoadDetail { repo: "o/alpha".into(), number: 12 }));
+    assert!(detail(&fresh).ready().is_some(), "cached detail opens at once");
 }

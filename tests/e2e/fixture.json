@@ -1,0 +1,402 @@
+{
+  "accounts": [
+    {
+      "login": "alice",
+      "active": true
+    },
+    {
+      "login": "bob",
+      "active": false
+    }
+  ],
+  "prs": {
+    "alice": [
+      {
+        "repo": "acme/widgets",
+        "number": 10,
+        "title": "Add widget cache",
+        "head": "feat/cache",
+        "base": "main",
+        "updated": "2026-10-20T10:00:00Z",
+        "ci": "SUCCESS",
+        "review": "APPROVED"
+      },
+      {
+        "repo": "acme/widgets",
+        "number": 11,
+        "title": "Cache eviction",
+        "head": "feat/evict",
+        "base": "feat/cache",
+        "updated": "2026-10-19T10:00:00Z",
+        "ci": "PENDING",
+        "review": "REVIEW_REQUIRED"
+      },
+      {
+        "repo": "acme/widgets",
+        "number": 12,
+        "title": "Eviction metrics",
+        "head": "feat/metrics",
+        "base": "feat/evict",
+        "draft": true,
+        "updated": "2026-10-18T10:00:00Z",
+        "ci": "SUCCESS",
+        "review": "REVIEW_REQUIRED"
+      },
+      {
+        "repo": "acme/widgets",
+        "number": 13,
+        "title": "WIP rewrite",
+        "head": "wip/rewrite",
+        "base": "main",
+        "draft": true,
+        "updated": "2026-10-05T10:00:00Z",
+        "review": "REVIEW_REQUIRED"
+      },
+      {
+        "repo": "acme/widgets",
+        "number": 14,
+        "title": "Docs for cache",
+        "head": "docs/cache",
+        "base": "main",
+        "updated": "2026-10-10T10:00:00Z",
+        "ci": "FAILURE",
+        "review": "REVIEW_REQUIRED"
+      },
+      {
+        "repo": "acme/gadgets",
+        "number": 3,
+        "title": "Fix gadget leak",
+        "head": "fix/leak",
+        "base": "main",
+        "updated": "2026-10-25T10:00:00Z",
+        "ci": "SUCCESS",
+        "review": "APPROVED"
+      },
+      {
+        "repo": "acme/gadgets",
+        "number": 4,
+        "title": "Gadget experiment base",
+        "head": "exp/base",
+        "base": "main",
+        "draft": true,
+        "updated": "2026-10-21T10:00:00Z",
+        "ci": "SUCCESS",
+        "review": "REVIEW_REQUIRED"
+      },
+      {
+        "repo": "acme/gadgets",
+        "number": 5,
+        "title": "Gadget experiment child",
+        "head": "exp/child",
+        "base": "exp/base",
+        "updated": "2026-10-22T10:00:00Z",
+        "ci": "SUCCESS",
+        "review": "REVIEW_REQUIRED"
+      },
+      {
+        "repo": "acme/zeta-old",
+        "number": 1,
+        "title": "Ancient change",
+        "head": "old/change",
+        "base": "main",
+        "updated": "2025-01-01T10:00:00Z",
+        "review": "REVIEW_REQUIRED"
+      }
+    ],
+    "bob": [
+      {
+        "repo": "bob/dotfiles",
+        "number": 7,
+        "title": "Tidy shell config",
+        "head": "tidy",
+        "base": "main",
+        "updated": "2026-10-24T10:00:00Z",
+        "ci": "SUCCESS"
+      }
+    ]
+  },
+  "threads": {
+    "acme/widgets#10": [
+      {
+        "path": "src/cache/mod.rs",
+        "line": 3,
+        "side": "RIGHT",
+        "resolved": false,
+        "comments": [
+          {
+            "author": "carol",
+            "body": "Why do we need Instant here?",
+            "at": "2026-10-21T09:00:00Z"
+          }
+        ]
+      },
+      {
+        "path": "src/cache/mod.rs",
+        "line": 2,
+        "side": "LEFT",
+        "resolved": false,
+        "comments": [
+          {
+            "author": "carol",
+            "body": "Keep Mutex? RwLock changes the locking semantics.",
+            "at": "2026-10-21T09:00:00Z"
+          },
+          {
+            "author": "alice",
+            "body": "RwLock is fine, reads dominate.",
+            "at": "2026-10-21T09:00:00Z"
+          }
+        ]
+      },
+      {
+        "path": "src/cache/store.rs",
+        "line": 1,
+        "side": "RIGHT",
+        "resolved": false,
+        "comments": [
+          {
+            "author": "dave",
+            "body": "Also it&#39;s worth checking the &quot;flush&quot; path &amp; the &lt;Drop&gt; impl.\n\nPoint 1: this store keeps every entry forever, so a long-running process grows without bound and nobody notices until memory runs out.\n\nPoint 2: this store keeps every entry forever, so a long-running process grows without bound and nobody notices until memory runs out.\n\nPoint 3: this store keeps every entry forever, so a long-running process grows without bound and nobody notices until memory runs out.\n\nPoint 4: this store keeps every entry forever, so a long-running process grows without bound and nobody notices until memory runs out.\n\nPoint 5: this store keeps every entry forever, so a long-running process grows without bound and nobody notices until memory runs out.\n\nPoint 6: this store keeps every entry forever, so a long-running process grows without bound and nobody notices until memory runs out.\n\nPoint 7: this store keeps every entry forever, so a long-running process grows without bound and nobody notices until memory runs out.\n\nPoint 8: this store keeps every entry forever, so a long-running process grows without bound and nobody notices until memory runs out.\n\nPoint 9: this store keeps every entry forever, so a long-running process grows without bound and nobody notices until memory runs out.\n\nPoint 10: this store keeps every entry forever, so a long-running process grows without bound and nobody notices until memory runs out.\n\nPoint 11: this store keeps every entry forever, so a long-running process grows without bound and nobody notices until memory runs out.\n\nPoint 12: this store keeps every entry forever, so a long-running process grows without bound and nobody notices until memory runs out.\n\nEND-OF-LONG-COMMENT",
+            "at": "2026-10-21T09:00:00Z"
+          }
+        ]
+      },
+      {
+        "path": "README.md",
+        "line": null,
+        "side": "RIGHT",
+        "resolved": true,
+        "outdated": true,
+        "comments": [
+          {
+            "author": "carol",
+            "body": "typo in the intro",
+            "at": "2026-10-21T09:00:00Z"
+          }
+        ]
+      }
+    ],
+    "acme/widgets#11": [
+      {
+        "path": "src/cache/evict.rs",
+        "line": 2,
+        "side": "RIGHT",
+        "resolved": false,
+        "comments": [
+          {
+            "author": "carol",
+            "body": "todo! left in",
+            "at": "2026-10-21T09:00:00Z"
+          }
+        ]
+      }
+    ],
+    "acme/gadgets#3": [
+      {
+        "path": "src/leak.rs",
+        "line": 6,
+        "side": "RIGHT",
+        "resolved": true,
+        "comments": [
+          {
+            "author": "erin",
+            "body": "drop is clearer",
+            "at": "2026-10-21T09:00:00Z"
+          }
+        ]
+      },
+      {
+        "path": "src/leak.rs",
+        "line": 5,
+        "side": "RIGHT",
+        "resolved": true,
+        "comments": [
+          {
+            "author": "erin",
+            "body": "nit: name",
+            "at": "2026-10-21T09:00:00Z"
+          }
+        ]
+      }
+    ]
+  },
+  "files": {
+    "acme/widgets#10": [
+      {
+        "filename": "src/cache/mod.rs",
+        "status": "modified",
+        "additions": 4,
+        "deletions": 2,
+        "patch": "@@ -1,5 +1,6 @@\n use std::collections::HashMap;\n-use std::sync::Mutex;\n+use std::sync::RwLock;\n+use std::time::Instant;\n \n pub struct Cache {\n     map: HashMap<String, String>,\n@@ -40,3 +41,4 @@ impl Cache {\n     pub fn get(&self, k: &str) -> Option<&String> {\n-        self.map.get(k)\n+        let hit = self.map.get(k);\n+        hit\n     }"
+      },
+      {
+        "filename": "src/cache/store.rs",
+        "status": "added",
+        "additions": 4,
+        "deletions": 0,
+        "patch": "@@ -0,0 +1,4 @@\n+pub struct Store;\n+\n+impl Store {\n+}"
+      },
+      {
+        "filename": "README.md",
+        "status": "modified",
+        "additions": 1,
+        "deletions": 1,
+        "patch": "@@ -1,2 +1,2 @@\n # widgets\n-Old intro text\n+New intro text"
+      },
+      {
+        "filename": "assets/logo.png",
+        "status": "added",
+        "additions": 0,
+        "deletions": 0
+      },
+      {
+        "filename": "src/lib.rs",
+        "status": "modified",
+        "additions": 1,
+        "deletions": 0,
+        "patch": "@@ -1 +1,2 @@\n pub mod cache;\n+pub mod store;"
+      }
+    ],
+    "acme/widgets#11": [
+      {
+        "filename": "src/cache/evict.rs",
+        "status": "added",
+        "additions": 3,
+        "deletions": 0,
+        "patch": "@@ -0,0 +1,3 @@\n+pub fn evict() {\n+    todo!()\n+}"
+      }
+    ],
+    "acme/gadgets#3": [
+      {
+        "filename": "src/leak.rs",
+        "status": "modified",
+        "additions": 1,
+        "deletions": 1,
+        "patch": "@@ -5,2 +5,2 @@\n fn leak(x: Gadget) {\n-    std::mem::forget(x);\n+    drop(x);"
+      }
+    ]
+  },
+  "status": {
+    "acme/widgets#14": {
+      "reviews": [
+        {
+          "author": {
+            "login": "carol"
+          },
+          "state": "CHANGES_REQUESTED",
+          "submittedAt": "2026-10-10T09:00:00Z",
+          "url": "https://github.com/acme/widgets/pull/14#pullrequestreview-1"
+        },
+        {
+          "author": {
+            "login": "dave"
+          },
+          "state": "APPROVED",
+          "submittedAt": "2026-10-10T08:00:00Z",
+          "url": "https://github.com/acme/widgets/pull/14#pullrequestreview-2"
+        },
+        {
+          "author": {
+            "login": "erin"
+          },
+          "state": "COMMENTED",
+          "submittedAt": "2026-10-09T08:00:00Z",
+          "url": "https://github.com/acme/widgets/pull/14#pullrequestreview-3"
+        }
+      ],
+      "requests": [
+        {
+          "requestedReviewer": {
+            "__typename": "User",
+            "login": "carol"
+          }
+        },
+        {
+          "requestedReviewer": {
+            "__typename": "Team",
+            "name": "docs-team"
+          }
+        }
+      ],
+      "checks": [
+        {
+          "__typename": "CheckRun",
+          "name": "build",
+          "status": "COMPLETED",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/acme/widgets/actions/runs/1/job/1",
+          "startedAt": "2026-10-10T10:00:00Z",
+          "completedAt": "2026-10-10T10:04:00Z",
+          "isRequired": true,
+          "checkSuite": {
+            "workflowRun": {
+              "workflow": {
+                "name": "CI"
+              }
+            }
+          }
+        },
+        {
+          "__typename": "CheckRun",
+          "name": "linkcheck",
+          "status": "COMPLETED",
+          "conclusion": "FAILURE",
+          "detailsUrl": "https://github.com/acme/widgets/actions/runs/1/job/2",
+          "startedAt": "2026-10-10T10:00:00Z",
+          "completedAt": "2026-10-10T10:07:00Z",
+          "isRequired": true,
+          "checkSuite": {
+            "workflowRun": {
+              "workflow": {
+                "name": "Docs"
+              }
+            }
+          }
+        },
+        {
+          "__typename": "CheckRun",
+          "name": "deploy-preview",
+          "status": "IN_PROGRESS",
+          "conclusion": null,
+          "detailsUrl": "https://github.com/acme/widgets/actions/runs/1/job/3",
+          "startedAt": "2026-10-10T10:00:00Z",
+          "completedAt": null,
+          "isRequired": false,
+          "checkSuite": {
+            "workflowRun": {
+              "workflow": {
+                "name": "Docs"
+              }
+            }
+          }
+        },
+        {
+          "__typename": "CheckRun",
+          "name": "spell",
+          "status": "COMPLETED",
+          "conclusion": "SKIPPED",
+          "detailsUrl": "https://github.com/acme/widgets/actions/runs/1/job/4",
+          "startedAt": null,
+          "completedAt": null,
+          "isRequired": false,
+          "checkSuite": {
+            "workflowRun": {
+              "workflow": {
+                "name": "Docs"
+              }
+            }
+          }
+        },
+        {
+          "__typename": "StatusContext",
+          "context": "ci/legacy",
+          "state": "SUCCESS",
+          "targetUrl": "https://ci.example.test/14",
+          "createdAt": "2026-10-10T10:00:00Z",
+          "isRequired": false
+        }
+      ],
+      "total": 7
+    }
+  }
+}

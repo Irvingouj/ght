@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -6,8 +6,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, DashRow, Detail, DiffRow, Focus, Load, Popup, Status, Tab, follow, visible_threads, wrap};
-use crate::model::{Checks, FileStatus, LineKind, PrDetail, Review, age};
+use crate::app::{App, DashRow, Detail, DiffRow, Focus, Load, Popup, Status, StatusItem, Tab, follow, status_items, visible_threads, wrap};
+use crate::model::{Check, CheckState, Checks, FileStatus, LineKind, PrDetail, Review, ReviewState, age};
 use crate::tree::RowKind;
 
 const ACCENT: Color = Color::Cyan;
@@ -57,14 +57,15 @@ fn draw_top(f: &mut Frame, area: Rect, app: &App) {
         0 => {}
         n => spans.push(Span::styled(format!("  {n} drafts hidden (d shows)"), Style::default().fg(Color::Magenta))),
     }
-    match &app.status {
-        Status::Loading => spans.push(Span::styled("  loading…", bold(Color::Yellow))),
-        Status::Failed(_) => spans.push(Span::styled("  load failed", bold(Color::Red))),
-        Status::Idle => {
-            if let Some(t) = app.loaded_at {
-                spans.push(Span::styled(format!("  updated {}", age(Utc::now(), t)), dim()));
-            }
-        }
+    if let Some(t) = app.loaded_at {
+        spans.push(Span::styled(format!("  updated {}", age(Utc::now(), t)), dim()));
+    }
+    match (&app.status, app.loaded_at.is_some()) {
+        (Status::Loading, true) => spans.push(Span::styled("  refreshing…", bold(Color::Yellow))),
+        (Status::Loading, false) => spans.push(Span::styled("  loading…", bold(Color::Yellow))),
+        (Status::Failed(_), true) => spans.push(Span::styled("  refresh failed", bold(Color::Red))),
+        (Status::Failed(_), false) => spans.push(Span::styled("  load failed", bold(Color::Red))),
+        (Status::Idle, _) => {}
     }
     f.render_widget(Line::from(spans), area);
 }
@@ -95,7 +96,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     let line = match &app.detail {
         None if app.dash.searching => {
             let n = app.dash_rows().iter().filter(|r| matches!(r, DashRow::Pr { .. })).count();
-            let total = app.prs.iter().filter(|p| app.dash.show_drafts || !p.is_draft).count();
+            let total = crate::app::shown_prs(&app.prs, app.dash.show_drafts).into_iter().filter(|s| *s).count();
             prompt(&app.dash.query, format!("  {n}/{total}   ↑↓ move · enter open · esc clear"))
         }
         None => hints(&[
@@ -105,7 +106,9 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
             ("{ }", "repo"),
             ("h/l", "fold"),
             ("d", "drafts"),
+            ("e", "editor"),
             ("o", "browser"),
+            ("y", "copy link"),
             ("r", "refresh"),
             ("a", "account"),
             ("?", "help"),
@@ -119,7 +122,9 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
                 ("C-d/C-u", "scroll"),
                 ("t", "show resolved"),
                 ("tab", "files"),
+                ("e", "editor"),
                 ("o", "browser"),
+                ("y", "copy link"),
                 ("r", "reload"),
                 ("q", "back"),
             ]),
@@ -130,7 +135,16 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
                 ("/", "find file"),
                 ("] [", "next/prev file"),
                 ("n/N", "thread"),
+                ("tab", "status"),
+                ("q", "back"),
+            ]),
+            (Tab::Status, _) => hints(&[
+                ("j/k", "move"),
+                ("enter/o", "open in browser"),
                 ("tab", "threads"),
+                ("e", "editor"),
+                ("y", "copy link"),
+                ("r", "reload"),
                 ("q", "back"),
             ]),
             (Tab::Files, Focus::Diff) => hints(&[
@@ -246,11 +260,17 @@ fn draw_dash(f: &mut Frame, area: Rect, app: &mut App) {
     let now = Utc::now();
     for (i, row) in rows.iter().enumerate().skip(app.dash.offset).take(height) {
         let mut line = match row {
-            DashRow::Group { repo, count, collapsed } => Line::from(vec![
-                Span::styled(if *collapsed { "▸ " } else { "▾ " }, bold(ACCENT)),
-                Span::styled(repo.clone(), bold(ACCENT)),
-                Span::styled(format!("  {count}"), dim()),
-            ]),
+            DashRow::Group { repo, count, collapsed, here } => {
+                let mut spans = vec![
+                    Span::styled(if *collapsed { "▸ " } else { "▾ " }, bold(ACCENT)),
+                    Span::styled(repo.clone(), bold(ACCENT)),
+                    Span::styled(format!("  {count}"), dim()),
+                ];
+                if *here {
+                    spans.push(Span::styled("  (this repo)", Style::default().fg(Color::Green)));
+                }
+                Line::from(spans)
+            }
             DashRow::Pr { idx, hl, stack } => {
                 let pr = &app.prs[*idx];
                 let (ci, ci_style) = match pr.checks {
@@ -370,6 +390,8 @@ fn draw_detail(f: &mut Frame, area: Rect, d: &mut Detail) {
             tab(format!(" Threads {unresolved}/{} ", data.threads.len()), d.tab == Tab::Threads),
             Span::raw(" "),
             tab(format!(" Files {} ", data.files.len()), d.tab == Tab::Files),
+            Span::raw(" "),
+            tab(format!(" Status {} ", check_counts(&data)), d.tab == Tab::Status),
             Span::styled("   tab switches", dim()),
         ]),
         tabs,
@@ -378,6 +400,124 @@ fn draw_detail(f: &mut Frame, area: Rect, d: &mut Detail) {
     match d.tab {
         Tab::Threads => draw_threads(f, body, d, &data),
         Tab::Files => draw_files(f, body, d, &data),
+        Tab::Status => draw_status(f, body, d, &data),
+    }
+}
+
+fn check_counts(data: &PrDetail) -> String {
+    let count = |s: CheckState| data.checks.iter().filter(|c| c.state == s).count();
+    let parts: Vec<String> = [(CheckState::Failing, "✗"), (CheckState::Pending, "●"), (CheckState::Passing, "✓")]
+        .into_iter()
+        .filter_map(|(s, icon)| match count(s) {
+            0 => None,
+            n => Some(format!("{icon}{n}")),
+        })
+        .collect();
+    parts.join(" ")
+}
+
+fn check_name(c: &Check) -> String {
+    match &c.workflow {
+        Some(w) => format!("{w} / {}", c.name),
+        None => c.name.clone(),
+    }
+}
+
+fn draw_status(f: &mut Frame, area: Rect, d: &mut Detail, data: &PrDetail) {
+    let items = status_items(data);
+    d.st_cursor = d.st_cursor.min(items.len().saturating_sub(1));
+    let block = pane(Line::styled(" Reviews and checks ", bold(ACCENT)), true);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let now = Utc::now();
+    let took = |from: Option<DateTime<Utc>>, to: DateTime<Utc>| match from.map(|s| age(to, s)) {
+        Some(t) if t == "now" => "<1m".to_string(),
+        Some(t) => t,
+        None => String::new(),
+    };
+
+    let mut rows: Vec<(Line, Option<usize>)> = vec![(Line::styled("Reviews", bold(Color::Reset)), None)];
+    if data.reviewers.is_empty() {
+        rows.push((Line::styled("  Nobody has reviewed or been asked to review yet.", dim()), None));
+    }
+    let name_w = data.reviewers.iter().map(|r| r.login.width()).max().unwrap_or(0).max(8);
+    let check_w = data.checks.iter().map(|c| check_name(c).width()).max().unwrap_or(0);
+    let mut checks_started = false;
+    for (n, item) in items.iter().enumerate() {
+        let line = match *item {
+            StatusItem::Reviewer(i) => {
+                let r = &data.reviewers[i];
+                let (icon, text, style) = match r.state {
+                    Some(ReviewState::ChangesRequested) => ("✗", "changes requested", bold(Color::Red)),
+                    Some(ReviewState::Approved) => ("✓", "approved", bold(Color::Green)),
+                    Some(ReviewState::Commented) => ("·", "commented", dim()),
+                    Some(ReviewState::Dismissed) => ("·", "dismissed", dim()),
+                    None => ("●", "review requested", bold(Color::Yellow)),
+                };
+                let mut spans = vec![
+                    Span::styled(format!("  {icon} "), style),
+                    Span::styled(pad(&r.login, name_w + 2), bold(Color::Reset)),
+                    Span::styled(pad(text, 19), style),
+                ];
+                if let Some(at) = r.at {
+                    spans.push(Span::styled(format!("{:>4}", age(now, at)), dim()));
+                }
+                if r.requested && r.state.is_some() {
+                    spans.push(Span::styled("  re-requested", Style::default().fg(Color::Yellow)));
+                }
+                Line::from(spans)
+            }
+            StatusItem::Check(i) => {
+                if !checks_started {
+                    checks_started = true;
+                    rows.push((Line::raw(""), None));
+                    rows.push((Line::from(vec![Span::styled("Checks  ", bold(Color::Reset)), Span::styled(check_counts(data), dim())]), None));
+                }
+                let c = &data.checks[i];
+                let (icon, style) = match c.state {
+                    CheckState::Failing => ("✗", bold(Color::Red)),
+                    CheckState::Pending => ("●", bold(Color::Yellow)),
+                    CheckState::Passing => ("✓", Style::default().fg(Color::Green)),
+                    CheckState::Skipped => ("–", dim()),
+                };
+                let time = match (c.state, c.completed) {
+                    (CheckState::Pending, _) => match c.started {
+                        Some(_) => format!("running {}", took(c.started, now)),
+                        None => "queued".into(),
+                    },
+                    (_, Some(done)) => took(c.started, done),
+                    _ => String::new(),
+                };
+                let name = check_name(c);
+                let tail = format!("{:<10}{time:>12}", if c.required { "required" } else { "" });
+                let room = (inner.width as usize).saturating_sub(4 + tail.width()).min(check_w + 2);
+                Line::from(vec![
+                    Span::styled(format!("  {icon} "), style),
+                    Span::styled(pad(&truncate(&name, room), room), if c.state == CheckState::Skipped { dim() } else { Style::default() }),
+                    Span::styled(tail, dim()),
+                ])
+            }
+        };
+        rows.push((line, Some(n)));
+    }
+    if !checks_started {
+        rows.push((Line::raw(""), None));
+        rows.push((Line::styled("Checks", bold(Color::Reset)), None));
+        rows.push((Line::styled("  No CI checks on the last commit.", dim()), None));
+    }
+    if data.checks_total > data.checks.len() {
+        let more = data.checks_total - data.checks.len();
+        rows.push((Line::styled(format!("  … {more} more checks, only shown on GitHub"), dim()), None));
+    }
+
+    let h = inner.height as usize;
+    d.st_page = h;
+    let cursor_row = rows.iter().position(|(_, item)| *item == Some(d.st_cursor)).unwrap_or(0);
+    follow(&mut d.st_offset, cursor_row, h);
+    d.st_offset = d.st_offset.min(rows.len().saturating_sub(h));
+    for (row, (line, item)) in rows.into_iter().enumerate().skip(d.st_offset).take(h) {
+        let line = if !items.is_empty() && item == Some(d.st_cursor) { line.style(cursor_style()) } else { line };
+        f.render_widget(line, Rect { y: inner.y + (row - d.st_offset) as u16, height: 1, ..inner });
     }
 }
 
@@ -615,6 +755,8 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("gg G", "top / bottom"),
             ("C-d C-u", "half page down / up"),
             ("o", "open in browser"),
+            ("e", "open $EDITOR (nvim) in the PR's local worktree"),
+            ("y", "copy the PR link"),
             ("r", "reload"),
             ("q", "back / quit"),
         ],
@@ -632,8 +774,9 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
     ),
     (
         "PR · Threads tab",
-        &[("enter", "jump to the code of this thread"), ("C-d C-u C-e C-y", "scroll the thread"), ("t", "show / hide resolved threads"), ("tab", "go to Files")],
+        &[("enter", "jump to the code of this thread"), ("C-d C-u C-e C-y", "scroll the thread"), ("t", "show / hide resolved threads"), ("tab", "next tab: Threads → Files → Status")],
     ),
+    ("PR · Status tab", &[("enter o", "open the review or check on GitHub")]),
     (
         "PR · Files tab",
         &[

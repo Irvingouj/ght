@@ -5,9 +5,10 @@ use chrono::{DateTime, Utc};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use unicode_width::UnicodeWidthChar;
 
+use crate::cache::{CachedDetail, Snapshot};
 use crate::fuzzy::Fuzzy;
 use crate::github::Account;
-use crate::model::{FileDiff, LineKind, Pr, PrDetail, Side, Thread};
+use crate::model::{FileDiff, LineKind, Pr, PrDetail, ReviewState, Side, Thread};
 use crate::tree::{self, RowKind, TreeRow};
 
 /// Columns the diff view spends before a thread's body text starts.
@@ -22,6 +23,11 @@ pub enum Effect {
     LoadPrs,
     LoadDetail { repo: String, number: u64 },
     Open(String),
+    Copy(String),
+    /// Open an editor in the local worktree that has `branch` of `repo` checked out.
+    Edit { repo: String, branch: String },
+    /// Fetch these PRs' details in the background so opening them is instant.
+    Prefetch(Vec<(String, u64)>),
 }
 
 pub enum Msg {
@@ -129,7 +135,8 @@ impl Keys {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DashRow {
-    Group { repo: String, count: usize, collapsed: bool },
+    /// `here` marks the repo of the git checkout ght was started in.
+    Group { repo: String, count: usize, collapsed: bool, here: bool },
     /// `stack` is the tree drawing (`├─ `, `│  └─ `) that puts a stacked PR under the PR it builds on.
     Pr { idx: usize, hl: Vec<u32>, stack: String },
 }
@@ -156,11 +163,12 @@ pub fn shown_prs(prs: &[Pr], show_drafts: bool) -> Vec<bool> {
     shown
 }
 
-/// Without a query: repos A→Z, newest stack first, stacked PRs indented under
-/// their base PR. With a query: only matches, best-scoring first, like fzf.
-pub fn dash_rows(prs: &[Pr], query: &str, collapsed: &HashSet<String>, show_drafts: bool) -> Vec<DashRow> {
+/// Without a query: the repo you started in first, then repos by their latest
+/// update, newest stack first, stacked PRs indented under their base PR.
+/// With a query: only matches, best-scoring first, like fzf.
+pub fn dash_rows(prs: &[Pr], query: &str, collapsed: &HashSet<String>, show_drafts: bool, here: &HashSet<String>) -> Vec<DashRow> {
     if !query.trim().is_empty() {
-        return search_rows(prs, query, show_drafts);
+        return search_rows(prs, query, show_drafts, here);
     }
     let shown = shown_prs(prs, show_drafts);
     let mut groups: BTreeMap<String, (String, Vec<usize>)> = BTreeMap::new();
@@ -168,10 +176,16 @@ pub fn dash_rows(prs: &[Pr], query: &str, collapsed: &HashSet<String>, show_draf
         groups.entry(prs[i].repo.to_lowercase()).or_insert_with(|| (prs[i].repo.clone(), Vec::new())).1.push(i);
     }
     let newest = |v: &mut Vec<usize>| v.sort_by(|&a, &b| prs[b].updated_at.cmp(&prs[a].updated_at));
+    let mut groups: Vec<(String, Vec<usize>)> = groups.into_values().collect();
+    groups.sort_by_key(|(repo, items)| {
+        let latest = items.iter().map(|&i| prs[i].updated_at).max();
+        (!here.contains(&repo.to_lowercase()), std::cmp::Reverse(latest))
+    });
     let mut rows = Vec::new();
-    for (repo, items) in groups.into_values() {
+    for (repo, items) in groups {
         let is_collapsed = collapsed.contains(&repo);
-        rows.push(DashRow::Group { repo, count: items.len(), collapsed: is_collapsed });
+        let is_here = here.contains(&repo.to_lowercase());
+        rows.push(DashRow::Group { repo, count: items.len(), collapsed: is_collapsed, here: is_here });
         if is_collapsed {
             continue;
         }
@@ -210,11 +224,12 @@ fn push_stack(i: usize, lead: &str, branch: &str, children: &HashMap<usize, Vec<
     }
 }
 
-fn search_rows(prs: &[Pr], query: &str, show_drafts: bool) -> Vec<DashRow> {
+fn search_rows(prs: &[Pr], query: &str, show_drafts: bool, here: &HashSet<String>) -> Vec<DashRow> {
     type Hit = (usize, u32, Vec<u32>);
     let mut groups: BTreeMap<String, (String, Vec<Hit>)> = BTreeMap::new();
     let mut fuzzy = Fuzzy::new(query);
-    for (i, pr) in prs.iter().enumerate().filter(|(_, p)| show_drafts || !p.is_draft) {
+    let shown = shown_prs(prs, show_drafts);
+    for (i, pr) in prs.iter().enumerate().filter(|(i, _)| shown[*i]) {
         let hay = format!("{} #{} {} {}", pr.title, pr.number, pr.repo, pr.head);
         let Some((score, idx)) = fuzzy.matches(&hay) else { continue };
         let title_len = pr.title.chars().count() as u32;
@@ -228,7 +243,8 @@ fn search_rows(prs: &[Pr], query: &str, show_drafts: bool) -> Vec<DashRow> {
     groups.sort_by_key(|(_, items)| std::cmp::Reverse(items.iter().map(|x| x.1).max().unwrap_or(0)));
     let mut rows = Vec::new();
     for (repo, items) in groups {
-        rows.push(DashRow::Group { repo, count: items.len(), collapsed: false });
+        let is_here = here.contains(&repo.to_lowercase());
+        rows.push(DashRow::Group { repo, count: items.len(), collapsed: false, here: is_here });
         rows.extend(items.into_iter().map(|(idx, _, hl)| DashRow::Pr { idx, hl, stack: String::new() }));
     }
     rows
@@ -249,6 +265,39 @@ pub struct Dash {
 pub enum Tab {
     Threads,
     Files,
+    Status,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusItem {
+    Reviewer(usize),
+    Check(usize),
+}
+
+fn status_url(data: &PrDetail, item: &StatusItem) -> Option<String> {
+    match *item {
+        StatusItem::Reviewer(i) => data.reviewers[i].url.clone(),
+        StatusItem::Check(i) => data.checks[i].url.clone(),
+    }
+}
+
+/// Reviewers, then checks; within each, what blocks the merge comes first.
+pub fn status_items(data: &PrDetail) -> Vec<StatusItem> {
+    let rank = |s: Option<ReviewState>| match s {
+        Some(ReviewState::ChangesRequested) => 0,
+        Some(ReviewState::Approved) => 1,
+        None => 2,
+        Some(ReviewState::Commented) => 3,
+        Some(ReviewState::Dismissed) => 4,
+    };
+    let mut reviewers: Vec<usize> = (0..data.reviewers.len()).collect();
+    reviewers.sort_by_key(|&i| (rank(data.reviewers[i].state), data.reviewers[i].login.to_lowercase()));
+    let mut checks: Vec<usize> = (0..data.checks.len()).collect();
+    checks.sort_by_key(|&i| {
+        let c = &data.checks[i];
+        (c.state, !c.required, c.workflow.clone(), c.name.clone())
+    });
+    reviewers.into_iter().map(StatusItem::Reviewer).chain(checks.into_iter().map(StatusItem::Check)).collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -373,6 +422,9 @@ pub struct Detail {
     pub diff_width: usize,
     pub file_query: String,
     pub file_searching: bool,
+    pub st_cursor: usize,
+    pub st_offset: usize,
+    pub st_page: usize,
 }
 
 impl Detail {
@@ -400,6 +452,9 @@ impl Detail {
             diff_width: 0,
             file_query: String::new(),
             file_searching: false,
+            st_cursor: 0,
+            st_offset: 0,
+            st_page: 20,
         };
         d.set_data(data);
         d
@@ -416,6 +471,7 @@ impl Detail {
         self.data = data;
         let Some(d) = self.ready() else { return };
         self.th_cursor = self.th_cursor.min(visible_threads(&d, self.show_resolved).len().saturating_sub(1));
+        self.st_cursor = self.st_cursor.min(status_items(&d).len().saturating_sub(1));
         match self.file {
             Some(f) if f < d.files.len() => self.clamp_diff(&d),
             _ => match tree::file_order(&d.files.iter().map(|f| f.path.clone()).collect::<Vec<_>>()).first() {
@@ -509,6 +565,8 @@ pub enum Popup {
 }
 
 pub struct App {
+    /// Lowercase `owner/name` of every GitHub remote of the directory ght started in.
+    pub here: HashSet<String>,
     pub accounts: Vec<String>,
     pub account: Option<String>,
     pub prs: Vec<Pr>,
@@ -517,6 +575,8 @@ pub struct App {
     pub dash: Dash,
     pub detail: Option<Detail>,
     pub cache: HashMap<(String, u64), Rc<PrDetail>>,
+    /// Each cached detail's PR `updatedAt` at fetch time, to tell which ones are stale.
+    pub detail_seen: HashMap<(String, u64), DateTime<Utc>>,
     pub popup: Option<Popup>,
     pub flash: Option<String>,
     keys: Keys,
@@ -531,6 +591,7 @@ impl Default for App {
 impl App {
     pub fn new() -> Self {
         Self {
+            here: HashSet::new(),
             accounts: Vec::new(),
             account: None,
             prs: Vec::new(),
@@ -539,6 +600,7 @@ impl App {
             dash: Dash { page: 20, ..Dash::default() },
             detail: None,
             cache: HashMap::new(),
+            detail_seen: HashMap::new(),
             popup: None,
             flash: None,
             keys: Keys::default(),
@@ -546,7 +608,7 @@ impl App {
     }
 
     pub fn dash_rows(&self) -> Vec<DashRow> {
-        dash_rows(&self.prs, &self.dash.query, &self.dash.collapsed, self.dash.show_drafts)
+        dash_rows(&self.prs, &self.dash.query, &self.dash.collapsed, self.dash.show_drafts, &self.here)
     }
 
     fn put_cursor_on(&mut self, key: Option<(String, u64)>) {
@@ -574,6 +636,12 @@ impl App {
     pub fn on_msg(&mut self, msg: Msg) -> Option<Effect> {
         match msg {
             Msg::Accounts(Ok(list)) => {
+                if let Some(current) = &self.account
+                    && list.iter().any(|a| &a.login == current)
+                {
+                    self.accounts = list.into_iter().map(|a| a.login).collect();
+                    return None;
+                }
                 self.account = list.iter().find(|a| a.active).or(list.first()).map(|a| a.login.clone());
                 self.accounts = list.into_iter().map(|a| a.login).collect();
                 if self.account.is_none() {
@@ -597,6 +665,11 @@ impl App {
                         self.status = Status::Idle;
                         self.loaded_at = Some(Utc::now());
                         self.put_cursor_on(keep);
+                        let stale: Vec<(String, u64)> =
+                            self.prs.iter().filter(|p| self.detail_seen.get(&p.key()) != Some(&p.updated_at)).map(Pr::key).collect();
+                        if !stale.is_empty() {
+                            return Some(Effect::Prefetch(stale));
+                        }
                     }
                     Err(e) => self.status = Status::Failed(e),
                 }
@@ -607,6 +680,9 @@ impl App {
                 match result {
                     Ok(data) => {
                         let data = Rc::new(data);
+                        if let Some(pr) = self.prs.iter().find(|p| p.repo == repo && p.number == number) {
+                            self.detail_seen.insert(pr.key(), pr.updated_at);
+                        }
                         self.cache.insert((repo, number), data.clone());
                         if let Some(d) = open {
                             d.refreshing = false;
@@ -627,6 +703,34 @@ impl App {
                 None
             }
         }
+    }
+
+    pub fn snapshot(&self) -> Snapshot {
+        let details = self
+            .prs
+            .iter()
+            .filter_map(|p| {
+                let key = p.key();
+                Some(CachedDetail {
+                    updated_at: *self.detail_seen.get(&key)?,
+                    detail: PrDetail::clone(self.cache.get(&key)?),
+                    repo: key.0,
+                    number: key.1,
+                })
+            })
+            .collect();
+        Snapshot { saved_at: self.loaded_at.unwrap_or_else(Utc::now), prs: self.prs.clone(), details }
+    }
+
+    /// Shows a saved snapshot until the refresh that is already on its way lands.
+    pub fn restore(&mut self, snapshot: Snapshot) {
+        self.prs = snapshot.prs;
+        self.loaded_at = Some(snapshot.saved_at);
+        for c in snapshot.details {
+            self.detail_seen.insert((c.repo.clone(), c.number), c.updated_at);
+            self.cache.insert((c.repo, c.number), Rc::new(c.detail));
+        }
+        self.put_cursor_on(None);
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<Effect> {
@@ -661,6 +765,8 @@ impl App {
                         self.account = Some(login);
                         self.prs.clear();
                         self.cache.clear();
+                        self.detail_seen.clear();
+                        self.loaded_at = None;
                         self.detail = None;
                         self.dash = Dash { page: self.dash.page, show_drafts: self.dash.show_drafts, ..Dash::default() };
                         self.status = Status::Loading;
@@ -729,6 +835,16 @@ impl App {
             KeyCode::Char('o') => {
                 if let Some(pr) = self.selected_pr() {
                     return Some(Effect::Open(pr.url.clone()));
+                }
+            }
+            KeyCode::Char('y') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(pr) = self.selected_pr() {
+                    return Some(Effect::Copy(pr.url.clone()));
+                }
+            }
+            KeyCode::Char('e') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(pr) = self.selected_pr() {
+                    return Some(Effect::Edit { repo: pr.repo.clone(), branch: pr.head.clone() });
                 }
             }
             KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right | KeyCode::Char(' ') | KeyCode::Char('h') | KeyCode::Left => {
@@ -817,14 +933,25 @@ impl App {
         if d.file_searching {
             return self.handle_file_search(key);
         }
-        let in_threads = d.tab == Tab::Threads;
         match key.code {
             KeyCode::Char('q') => {
                 self.detail = None;
                 return None;
             }
-            KeyCode::Tab | KeyCode::BackTab => {
-                d.tab = if in_threads { Tab::Files } else { Tab::Threads };
+            KeyCode::Tab => {
+                d.tab = match d.tab {
+                    Tab::Threads => Tab::Files,
+                    Tab::Files => Tab::Status,
+                    Tab::Status => Tab::Threads,
+                };
+                return None;
+            }
+            KeyCode::BackTab => {
+                d.tab = match d.tab {
+                    Tab::Threads => Tab::Status,
+                    Tab::Files => Tab::Threads,
+                    Tab::Status => Tab::Files,
+                };
                 return None;
             }
             KeyCode::Char('r') => {
@@ -835,6 +962,12 @@ impl App {
                 self.popup = Some(Popup::Help);
                 return None;
             }
+            KeyCode::Char('e') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return Some(Effect::Edit { repo: d.pr.repo.clone(), branch: d.pr.head.clone() });
+            }
+            KeyCode::Char('y') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return Some(Effect::Copy(d.pr.url.clone()));
+            }
             KeyCode::Char('t') => {
                 d.show_resolved = !d.show_resolved;
                 if let Some(data) = d.ready() {
@@ -844,15 +977,15 @@ impl App {
                 return None;
             }
             KeyCode::Char('o') => {
-                let thread_url = d.ready().and_then(|data| {
-                    let t = *visible_threads(&data, d.show_resolved).get(d.th_cursor)?;
-                    data.threads[t].url().map(str::to_string)
-                });
-                return Some(Effect::Open(match (in_threads, thread_url) {
-                    (true, Some(url)) => url,
-                    (false, _) => format!("{}/files", d.pr.url),
-                    _ => d.pr.url.clone(),
-                }));
+                let url = match d.tab {
+                    Tab::Threads => d.ready().and_then(|data| {
+                        let t = *visible_threads(&data, d.show_resolved).get(d.th_cursor)?;
+                        data.threads[t].url().map(str::to_string)
+                    }),
+                    Tab::Files => Some(format!("{}/files", d.pr.url)),
+                    Tab::Status => d.ready().and_then(|data| status_url(&data, status_items(&data).get(d.st_cursor)?)),
+                };
+                return Some(Effect::Open(url.unwrap_or_else(|| d.pr.url.clone())));
             }
             _ => {}
         }
@@ -862,13 +995,34 @@ impl App {
             }
             return None;
         };
-        if in_threads {
-            return self.handle_threads(key, &data);
+        match (d.tab, d.focus) {
+            (Tab::Threads, _) => self.handle_threads(key, &data),
+            (Tab::Status, _) => self.handle_status(key, &data),
+            (Tab::Files, Focus::Tree) => self.handle_tree(key, &data),
+            (Tab::Files, Focus::Diff) => self.handle_diff(key, &data),
         }
-        match d.focus {
-            Focus::Tree => self.handle_tree(key, &data),
-            Focus::Diff => self.handle_diff(key, &data),
+    }
+
+    fn handle_status(&mut self, key: KeyEvent, data: &PrDetail) -> Option<Effect> {
+        let d = self.detail.as_mut()?;
+        let items = status_items(data);
+        match self.keys.motion(&key) {
+            Pre::Motion(m) => {
+                d.st_cursor = apply(m, d.st_cursor, items.len(), d.st_page);
+                return None;
+            }
+            Pre::Consumed => return None,
+            Pre::Other => {}
         }
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
+                let url = items.get(d.st_cursor).and_then(|item| status_url(data, item));
+                return Some(Effect::Open(url.unwrap_or_else(|| d.pr.url.clone())));
+            }
+            KeyCode::Esc | KeyCode::Char('h') | KeyCode::Left => self.detail = None,
+            _ => {}
+        }
+        None
     }
 
     fn handle_threads(&mut self, key: KeyEvent, data: &PrDetail) -> Option<Effect> {
